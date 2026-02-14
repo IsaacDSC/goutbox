@@ -107,4 +107,3 @@ func (s *Service) startTasks(ctx context.Context, pub Publisher) error {
 	return nil
 
 }
-
