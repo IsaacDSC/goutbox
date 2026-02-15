@@ -150,6 +150,93 @@ type Store interface {
 }
 ```
 
+## PostgreSQL Store (Persistência)
+
+Para ambientes de produção, utilize o módulo PostgreSQL que oferece persistência durável e suporte a múltiplas instâncias.
+
+### Instalação
+
+O PostgreSQL store é um módulo separado para manter o core leve:
+
+```bash
+# Apenas o core (sem dependências pesadas)
+go get github.com/IsaacDSC/goutbox
+
+# PostgreSQL store (inclui driver pq)
+go get github.com/IsaacDSC/goutbox/stores/postgres
+```
+
+### Uso com PostgreSQL
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "log"
+    "time"
+
+    "github.com/IsaacDSC/goutbox"
+    "github.com/IsaacDSC/goutbox/stores/postgres"
+    _ "github.com/lib/pq"
+)
+
+func main() {
+    // Conecta ao PostgreSQL
+    db, err := sql.Open("postgres", "postgres://user:pass@localhost:5432/mydb?sslmode=disable")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    // Cria a store (migrations são executadas automaticamente)
+    store, err := postgres.NewPostgresStore(db,
+        postgres.WithRetryInterval(1*time.Second),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Usa normalmente com o outbox
+    outbox := goutbox.New(store)
+    
+    ctx := context.Background()
+    go outbox.Start(ctx, publisher)
+
+    // ...
+}
+```
+
+### Opções do PostgreSQL Store
+
+| Opção | Descrição | Default |
+|-------|-----------|---------|
+| `WithRetryInterval(d time.Duration)` | Tempo mínimo antes de retentar uma task | 500ms |
+| `WithSkipMigration()` | Desabilita migrations automáticas | false |
+
+```go
+// Com migrations gerenciadas externamente (Flyway, golang-migrate, etc.)
+store, err := postgres.NewPostgresStore(db,
+    postgres.WithRetryInterval(2*time.Second),
+    postgres.WithSkipMigration(),
+)
+```
+
+### Docker Compose
+
+O projeto inclui um `docker-compose.yml` para desenvolvimento:
+
+```bash
+# Subir PostgreSQL
+docker-compose up -d
+
+# Derrubar
+docker-compose down
+```
+
+A tabela `outbox_tasks` é criada automaticamente pelo container usando o mesmo SQL embarcado no código.
+
 ## Configuração
 
 A biblioteca usa o padrão **Functional Options** para configuração flexível:

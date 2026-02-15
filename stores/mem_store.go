@@ -63,7 +63,7 @@ func (ms *MemStore) DiscardTask(ctx context.Context, key string, isOk bool) erro
 func (ms *MemStore) Close() error {
 	// backup in database or file OR schedule process all tasks in next cycle
 	for ts, task := range ms.db {
-		// se a tarefa tem menos de 500ms, adiciona para processar no próximo ciclo
+		// if task is less than 500ms old, add to process in next cycle
 		log.Printf("task %s with error, created at %s, pending to process in next cycle", task.Key, ts)
 	}
 
