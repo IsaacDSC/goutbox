@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: goutbox_postgres
+    environment:
+      POSTGRES_USER: goutbox
+      POSTGRES_PASSWORD: goutbox_secret
+      POSTGRES_DB: goutbox_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Usa o MESMO arquivo SQL que é embarcado no código Go
+      - ./stores/postgres/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U goutbox -d goutbox_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

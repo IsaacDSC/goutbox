@@ -1,4 +1,4 @@
-.PHONY: mocks test
+.PHONY: mocks test test-all
 
 mocks:
 	@echo "Generating mocks..."
@@ -8,3 +8,9 @@ mocks:
 
 test:
 	go test -v -race ./...
+
+test-all:
+	@echo "Testing core module..."
+	go test -v -race ./...
+	@echo "Testing stores/postgres module..."
+	cd stores/postgres && go test -v -race ./...

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,11 +14,38 @@ import (
 	"time"
 
 	"github.com/IsaacDSC/goutbox"
-	"github.com/IsaacDSC/goutbox/stores"
+	"github.com/IsaacDSC/goutbox/stores/postgres"
+	_ "github.com/lib/pq"
 )
 
 func main() {
-	store := stores.NewMemStore()
+	// Connect to PostgreSQL
+	// Use environment variable or default connection string
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		connStr = "postgres://goutbox:goutbox_secret@localhost:5432/goutbox_db?sslmode=disable"
+	}
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatalf("failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	// Verify connection
+	if err := db.Ping(); err != nil {
+		log.Fatalf("failed to ping database: %v", err)
+	}
+	log.Println("Connected to PostgreSQL")
+
+	// Create PostgreSQL store with options
+	// Migrations run automatically (idempotent)
+	store, err := postgres.NewPostgresStore(db,
+		postgres.WithRetryInterval(1*time.Second),
+	)
+	if err != nil {
+		log.Fatalf("failed to create postgres store: %v", err)
+	}
 
 	// Context with cancellation to control shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -35,7 +63,6 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /event", func(w http.ResponseWriter, r *http.Request) {
-		// handle event
 		var payload struct {
 			EventName string         `json:"event_name"`
 			Payload   map[string]any `json:"payload"`
@@ -60,7 +87,8 @@ func main() {
 			return
 		}
 
-		w.WriteHeader(http.StatusCreated)
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, "Event %s queued successfully\n", payload.EventName)
 	})
 
 	server := &http.Server{
@@ -68,44 +96,33 @@ func main() {
 		Handler: mux,
 	}
 
-	// Channel to capture system signals
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	// Start the server in a goroutine
+	// Start server in goroutine
 	go func() {
-		log.Println("Server starting on :8080")
+		log.Println("Starting server on :8080")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("failed to start server: %v", err)
+			log.Fatalf("server error: %v", err)
 		}
 	}()
 
-	// Wait for shutdown signal
-	<-quit
-	log.Println("Shutting down server...")
+	// Wait for interrupt signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
 
-	// Context with timeout for server shutdown
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
+	log.Println("Shutting down...")
 
-	// Graceful shutdown of HTTP server
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Server forced to shutdown: %v", err)
-	}
-	log.Println("HTTP server stopped")
-
-	// Cancel outbox context to stop processing
+	// Cancel context to stop outbox
 	cancel()
 
-	// Wait for outbox to finish
+	// Wait for outbox to finish processing
 	<-outboxDone
-	log.Println("Outbox stopped")
 
-	// Close the store
-	store.Close()
-	log.Println("Store closed")
+	// Graceful shutdown of HTTP server
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	server.Shutdown(shutdownCtx)
 
-	log.Println("Graceful shutdown completed")
+	log.Println("Shutdown complete")
 }
 
 // simulatePublisher simulates event publishing with random failures
