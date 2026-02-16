@@ -278,6 +278,16 @@ func TestPostgresStore_DiscardTask_Success(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
+	// Wait for retry interval and get tasks to put them in processing state
+	time.Sleep(60 * time.Millisecond)
+	tasks, err := store.GetTasksWithError(ctx)
+	if err != nil {
+		t.Fatalf("GetTasksWithError() error = %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task to be processing, got %d", len(tasks))
+	}
+
 	// Discard as success
 	if err := store.DiscardTask(ctx, task.Key, true); err != nil {
 		t.Errorf("DiscardTask() error = %v", err)
@@ -285,7 +295,7 @@ func TestPostgresStore_DiscardTask_Success(t *testing.T) {
 
 	// Verify task is no longer pending
 	time.Sleep(100 * time.Millisecond)
-	tasks, err := store.GetTasksWithError(ctx)
+	tasks, err = store.GetTasksWithError(ctx)
 	if err != nil {
 		t.Fatalf("GetTasksWithError() error = %v", err)
 	}
@@ -314,6 +324,16 @@ func TestPostgresStore_DiscardTask_Failure(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
+	// Wait for retry interval and get tasks to put them in processing state
+	time.Sleep(60 * time.Millisecond)
+	tasks, err := store.GetTasksWithError(ctx)
+	if err != nil {
+		t.Fatalf("GetTasksWithError() error = %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task to be processing, got %d", len(tasks))
+	}
+
 	// Discard as failure
 	if err := store.DiscardTask(ctx, task.Key, false); err != nil {
 		t.Errorf("DiscardTask() error = %v", err)
@@ -321,7 +341,7 @@ func TestPostgresStore_DiscardTask_Failure(t *testing.T) {
 
 	// Verify task is no longer pending
 	time.Sleep(100 * time.Millisecond)
-	tasks, err := store.GetTasksWithError(ctx)
+	tasks, err = store.GetTasksWithError(ctx)
 	if err != nil {
 		t.Fatalf("GetTasksWithError() error = %v", err)
 	}
