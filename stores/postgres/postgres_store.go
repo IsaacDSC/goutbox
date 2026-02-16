@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/IsaacDSC/goutbox"
-	_ "github.com/lib/pq" // PostgreSQL driver
+	"github.com/lib/pq" // PostgreSQL driver
 )
 
 // migrationSQL contains the embedded SQL migration script.
@@ -150,52 +150,101 @@ func (ps *PostgresStore) Create(ctx context.Context, task goutbox.Task) error {
 	return err
 }
 
-// GetTasksWithError retrieves tasks with pending status that are ready for retry.
+// GetTasksWithError retrieves and atomically claims tasks ready for processing.
+// Uses FOR UPDATE SKIP LOCKED to prevent concurrent workers from claiming the same task.
+// Claimed tasks are marked as 'processing' status.
 // Returns only tasks whose updated_at is older than the configured retryInterval.
 // Limits to 100 tasks per query to avoid overload.
 func (ps *PostgresStore) GetTasksWithError(ctx context.Context) ([]goutbox.Task, error) {
-	// Values ($1, $2) are parameterized to prevent SQL injection
-	const query = `
+	// Start transaction for atomic claim
+	tx, err := ps.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Select and lock rows atomically with SKIP LOCKED to avoid contention
+	// This ensures multiple workers don't process the same task
+	const selectQuery = `
 		SELECT key, payload, errors, attempts, max_attempts
 		FROM outbox_tasks
 		WHERE status = $1
 		AND updated_at < NOW() - make_interval(secs => $2)
 		ORDER BY updated_at ASC
 		LIMIT 100
+		FOR UPDATE SKIP LOCKED
 	`
 
 	// Convert retryInterval to seconds (float64 to support milliseconds)
 	intervalSeconds := ps.retryInterval.Seconds()
-	rows, err := ps.db.QueryContext(ctx, query, StatusPending, intervalSeconds)
+	rows, err := tx.QueryContext(ctx, selectQuery, StatusPending, intervalSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tasks: %w", err)
 	}
-	defer rows.Close()
 
 	var tasks []goutbox.Task
+	var keys []string
 	for rows.Next() {
 		var task goutbox.Task
 		var payloadJSON, errorsJSON []byte
 		var maxAttempts int
 
 		if err := rows.Scan(&task.Key, &payloadJSON, &errorsJSON, &task.Attempts, &maxAttempts); err != nil {
+			rows.Close()
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
 		// Deserialize JSONB payload
 		if err := json.Unmarshal(payloadJSON, &task.Payload); err != nil {
+			rows.Close()
 			return nil, fmt.Errorf("failed to unmarshal payload: %w", err)
 		}
 
+		// Deserialize JSONB errors to restore retry history
+		var errorStrings []string
+		if err := json.Unmarshal(errorsJSON, &errorStrings); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("failed to unmarshal errors: %w", err)
+		}
+		task.Error = parseErrors(errorStrings)
+
 		task.Config.MaxAttempts = maxAttempts
 		tasks = append(tasks, task)
+		keys = append(keys, task.Key)
+	}
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
 
-	return tasks, rows.Err()
+	// If no tasks found, commit and return early
+	if len(keys) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return tasks, nil
+	}
+
+	// Mark claimed tasks as processing
+	const updateQuery = `
+		UPDATE outbox_tasks
+		SET status = $1, updated_at = NOW()
+		WHERE key = ANY($2)
+	`
+	if _, err := tx.ExecContext(ctx, updateQuery, StatusProcessing, pq.Array(keys)); err != nil {
+		return nil, fmt.Errorf("failed to mark tasks as processing: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return tasks, nil
 }
 
 // UpdateTaskError updates a task with error information after a failed attempt.
-// Increments the attempts counter and updates the timestamp for retry control.
+// Returns the task to pending status for retry, updates error history and attempt count.
 func (ps *PostgresStore) UpdateTaskError(ctx context.Context, task goutbox.Task) error {
 	// Serialize errors for JSONB storage
 	errorsJSON, err := json.Marshal(formatErrors(task.Error))
@@ -203,16 +252,18 @@ func (ps *PostgresStore) UpdateTaskError(ctx context.Context, task goutbox.Task)
 		return fmt.Errorf("failed to marshal errors: %w", err)
 	}
 
-	// Values ($1-$4) are parameterized to prevent SQL injection
+	// Values ($1-$5) are parameterized to prevent SQL injection
+	// Returns task to pending status so it can be picked up again after retryInterval
 	const query = `
 		UPDATE outbox_tasks
 		SET errors = $1,
 			attempts = $2,
+			status = $3,
 			updated_at = NOW()
-		WHERE key = $3 AND status = $4
+		WHERE key = $4 AND status = $5
 	`
 
-	_, err = ps.db.ExecContext(ctx, query, errorsJSON, task.Attempts, task.Key, StatusPending)
+	_, err = ps.db.ExecContext(ctx, query, errorsJSON, task.Attempts, StatusPending, task.Key, StatusProcessing)
 	return err
 }
 
@@ -227,9 +278,24 @@ func formatErrors(errs []error) []string {
 	return result
 }
 
+// parseErrors converts a slice of strings back to a slice of errors
+func parseErrors(errStrs []string) []error {
+	if len(errStrs) == 0 {
+		return nil
+	}
+	result := make([]error, len(errStrs))
+	for i, s := range errStrs {
+		if s != "" {
+			result[i] = fmt.Errorf("%s", s)
+		}
+	}
+	return result
+}
+
 // DiscardTask marks a task as finished.
 // If isOk=true, marks as StatusCompleted (success).
 // If isOk=false, marks as StatusFailed (permanent failure).
+// Only operates on tasks currently being processed (StatusProcessing).
 func (ps *PostgresStore) DiscardTask(ctx context.Context, key string, isOk bool) error {
 	// Determine final status based on result
 	var status TaskStatus
@@ -247,14 +313,8 @@ func (ps *PostgresStore) DiscardTask(ctx context.Context, key string, isOk bool)
 		WHERE key = $2 AND status = $3
 	`
 
-	_, err := ps.db.ExecContext(ctx, query, status, key, StatusPending)
+	_, err := ps.db.ExecContext(ctx, query, status, key, StatusProcessing)
 	return err
-}
-
-// Close closes the database connection.
-// Should be called when the store is no longer needed to release resources.
-func (ps *PostgresStore) Close() error {
-	return ps.db.Close()
 }
 
 // migrate creates the table and indexes if they don't exist.

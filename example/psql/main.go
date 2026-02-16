@@ -122,9 +122,6 @@ func main() {
 	defer shutdownCancel()
 	server.Shutdown(shutdownCtx)
 
-	// Close store
-	store.Close()
-
 	log.Println("Shutdown complete")
 }
 

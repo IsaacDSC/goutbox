@@ -3,6 +3,9 @@
 -- And also used by docker-compose for initialization
 -- Table name: outbox_tasks (fixed for simplicity and to prevent SQL injection)
 
+-- Enable pgcrypto extension for gen_random_uuid() (required for PostgreSQL < 13)
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- Create table only if it doesn't exist (idempotent)
 CREATE TABLE IF NOT EXISTS outbox_tasks (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),

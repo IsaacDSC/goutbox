@@ -4,19 +4,26 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/IsaacDSC/goutbox"
 	"github.com/IsaacDSC/goutbox/stores/postgres"
+	"github.com/docker/go-connections/nat"
 	_ "github.com/lib/pq"
 	"github.com/testcontainers/testcontainers-go"
 	pgcontainer "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-func setupPostgresContainer(t *testing.T) (*sql.DB, func()) {
-	t.Helper()
+var (
+	testDB        *sql.DB
+	testContainer *pgcontainer.PostgresContainer
+)
+
+func TestMain(m *testing.M) {
 	ctx := context.Background()
 
 	pgContainer, err := pgcontainer.Run(ctx,
@@ -25,47 +32,76 @@ func setupPostgresContainer(t *testing.T) (*sql.DB, func()) {
 		pgcontainer.WithUsername("test"),
 		pgcontainer.WithPassword("test"),
 		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
+			wait.ForSQL("5432/tcp", "postgres", func(host string, port nat.Port) string {
+				return fmt.Sprintf("host=%s port=%s user=test password=test dbname=testdb sslmode=disable", host, port.Port())
+			}).WithStartupTimeout(60*time.Second),
 		),
 	)
 	if err != nil {
-		t.Fatalf("failed to start postgres container: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to start postgres container: %v\n", err)
+		os.Exit(1)
 	}
+	testContainer = pgContainer
 
 	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		pgContainer.Terminate(ctx)
-		t.Fatalf("failed to get connection string: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to get connection string: %v\n", err)
+		os.Exit(1)
 	}
 
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		pgContainer.Terminate(ctx)
-		t.Fatalf("failed to connect to database: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to connect to database: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Verify connection
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		pgContainer.Terminate(ctx)
-		t.Fatalf("failed to ping database: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to ping database: %v\n", err)
+		os.Exit(1)
 	}
 
-	cleanup := func() {
+	testDB = db
+
+	// Run migrations once
+	_, err = postgres.NewPostgresStore(db)
+	if err != nil {
 		db.Close()
 		pgContainer.Terminate(ctx)
+		fmt.Fprintf(os.Stderr, "failed to run initial migrations: %v\n", err)
+		os.Exit(1)
 	}
 
-	return db, cleanup
+	code := m.Run()
+
+	db.Close()
+	pgContainer.Terminate(ctx)
+	os.Exit(code)
+}
+
+// resetDB truncates the outbox_tasks table to ensure test isolation
+func resetDB(t *testing.T) {
+	t.Helper()
+	_, err := testDB.ExecContext(context.Background(), "TRUNCATE TABLE outbox_tasks")
+	if err != nil {
+		t.Fatalf("failed to reset database: %v", err)
+	}
+}
+
+// getTestDB returns the shared database connection and resets state
+func getTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	resetDB(t)
+	return testDB
 }
 
 func TestPostgresStore_NewPostgresStore(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	store, err := postgres.NewPostgresStore(db)
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration())
 	if err != nil {
 		t.Fatalf("NewPostgresStore() error = %v", err)
 	}
@@ -83,10 +119,9 @@ func TestPostgresStore_NewPostgresStore_NilDB(t *testing.T) {
 }
 
 func TestPostgresStore_Create(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	store, err := postgres.NewPostgresStore(db)
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration())
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
@@ -104,10 +139,9 @@ func TestPostgresStore_Create(t *testing.T) {
 }
 
 func TestPostgresStore_Create_DuplicateKey(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	store, err := postgres.NewPostgresStore(db)
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration())
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
@@ -131,10 +165,9 @@ func TestPostgresStore_Create_DuplicateKey(t *testing.T) {
 }
 
 func TestPostgresStore_GetTasksWithError(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	store, err := postgres.NewPostgresStore(db, postgres.WithRetryInterval(100*time.Millisecond))
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration(), postgres.WithRetryInterval(100*time.Millisecond))
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
@@ -169,10 +202,9 @@ func TestPostgresStore_GetTasksWithError(t *testing.T) {
 }
 
 func TestPostgresStore_GetTasksWithError_RespectsRetryInterval(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	store, err := postgres.NewPostgresStore(db, postgres.WithRetryInterval(2*time.Second))
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration(), postgres.WithRetryInterval(2*time.Second))
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
@@ -201,10 +233,9 @@ func TestPostgresStore_GetTasksWithError_RespectsRetryInterval(t *testing.T) {
 }
 
 func TestPostgresStore_UpdateTaskError(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	store, err := postgres.NewPostgresStore(db)
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration())
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
@@ -229,10 +260,9 @@ func TestPostgresStore_UpdateTaskError(t *testing.T) {
 }
 
 func TestPostgresStore_DiscardTask_Success(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	store, err := postgres.NewPostgresStore(db, postgres.WithRetryInterval(50*time.Millisecond))
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration(), postgres.WithRetryInterval(50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
@@ -266,10 +296,9 @@ func TestPostgresStore_DiscardTask_Success(t *testing.T) {
 }
 
 func TestPostgresStore_DiscardTask_Failure(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	store, err := postgres.NewPostgresStore(db, postgres.WithRetryInterval(50*time.Millisecond))
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration(), postgres.WithRetryInterval(50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
@@ -303,18 +332,10 @@ func TestPostgresStore_DiscardTask_Failure(t *testing.T) {
 }
 
 func TestPostgresStore_WithSkipMigration(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	// Run migrations manually first
-	store1, err := postgres.NewPostgresStore(db)
-	if err != nil {
-		t.Fatalf("failed to create store with migrations: %v", err)
-	}
-	_ = store1
-
-	// Now create store with skip migration
-	store2, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration())
+	// Migrations already ran in TestMain, create store with skip migration
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration())
 	if err != nil {
 		t.Fatalf("failed to create store with skip migration: %v", err)
 	}
@@ -327,16 +348,15 @@ func TestPostgresStore_WithSkipMigration(t *testing.T) {
 		Config:  goutbox.Config{MaxAttempts: 3},
 	}
 
-	if err := store2.Create(ctx, task); err != nil {
+	if err := store.Create(ctx, task); err != nil {
 		t.Errorf("Create() with skip migration error = %v", err)
 	}
 }
 
 func TestPostgresStore_FullWorkflow(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	store, err := postgres.NewPostgresStore(db, postgres.WithRetryInterval(100*time.Millisecond))
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration(), postgres.WithRetryInterval(100*time.Millisecond))
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
@@ -398,18 +418,10 @@ func TestPostgresStore_FullWorkflow(t *testing.T) {
 }
 
 func TestPostgresStore_Close(t *testing.T) {
-	db, cleanup := setupPostgresContainer(t)
-	defer cleanup()
+	db := getTestDB(t)
 
-	// Create a separate db connection for the store
 	ctx := context.Background()
-	connStr, err := db.Query("SELECT current_database()")
-	if err != nil {
-		t.Fatalf("failed to query: %v", err)
-	}
-	connStr.Close()
-
-	store, err := postgres.NewPostgresStore(db)
+	store, err := postgres.NewPostgresStore(db, postgres.WithSkipMigration())
 	if err != nil {
 		t.Fatalf("failed to create store: %v", err)
 	}
